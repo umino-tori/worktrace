@@ -209,5 +209,5 @@ __marimo__/
 claude.md
 gemini.md
 instruction
-.gitignore*Zone*Identifier
+# .gitignore*Zone*Identifier
 
