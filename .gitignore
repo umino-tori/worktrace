@@ -212,3 +212,4 @@ instruction
 timelayer.db
 worktrace.db
 node_modules
+*Zone*Identifier
