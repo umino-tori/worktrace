@@ -23,6 +23,12 @@ function timeToMinutes(hhmm) {
   return h * 60 + m
 }
 
+// 日またぎエントリの場合、当日ビューでは終端を1440分(24:00)に丸める
+function effectiveEndMinutes(entry) {
+  if (entry.end_date && entry.end_date > entry.start_date) return 1440
+  return timeToMinutes(entry.end_time)
+}
+
 function formatDuration(minutes) {
   if (minutes < 60) return `${minutes}分`
   const h = Math.floor(minutes / 60)
@@ -30,23 +36,31 @@ function formatDuration(minutes) {
   return m === 0 ? `${h}時間` : `${h}時間${m}分`
 }
 
+// MM/DD 形式で表示
+function formatShortDate(dateStr) {
+  if (!dateStr) return ''
+  const [, m, d] = dateStr.split('-')
+  return `${parseInt(m)}/${parseInt(d)}`
+}
+
 const HOUR_MARKS = [0, 6, 9, 12, 15, 18, 21, 24]
 
-export default function Timeline({ entries, onDelete }) {
-  // 総作業時間
+export default function Timeline({ entries, recentEntries, onDelete, onClone, selectedDate }) {
+  // 選択日の総作業時間（24h バー用）
   const totalMinutes = useMemo(
     () => entries.reduce((sum, e) => sum + e.duration_minutes, 0),
     [entries]
   )
 
-  // 隙間時間の計算
+  // 選択日の隙間時間（24h バー用）
   const gaps = useMemo(() => {
     if (entries.length === 0) return []
     const sorted = [...entries].sort((a, b) => timeToMinutes(a.start_time) - timeToMinutes(b.start_time))
     const result = []
     for (let i = 0; i < sorted.length - 1; i++) {
-      const endMin = timeToMinutes(sorted[i].end_time)
+      const endMin = effectiveEndMinutes(sorted[i])
       const nextStart = timeToMinutes(sorted[i + 1].start_time)
+      if (endMin >= 1440) continue  // 日またぎで当日最後まで埋まっているので隙間なし
       if (nextStart > endMin) {
         result.push({ start: sorted[i].end_time, end: sorted[i + 1].start_time, minutes: nextStart - endMin })
       }
@@ -54,11 +68,11 @@ export default function Timeline({ entries, onDelete }) {
     return result
   }, [entries])
 
-  if (entries.length === 0) {
+  if (recentEntries.length === 0) {
     return (
       <div className="text-center py-12 text-slate-400">
         <div className="text-4xl mb-3">🕐</div>
-        <p className="font-medium">この日の記録はありません</p>
+        <p className="font-medium">記録がありません</p>
         <p className="text-sm mt-1">上のフォームから作業を記録してください</p>
       </div>
     )
@@ -66,86 +80,100 @@ export default function Timeline({ entries, onDelete }) {
 
   return (
     <div className="space-y-6">
-      {/* サマリー */}
-      <div className="flex items-center gap-4 text-sm">
-        <div className="bg-indigo-50 text-indigo-700 rounded-lg px-3 py-1.5 font-semibold">
-          合計 {formatDuration(totalMinutes)}
-        </div>
-        {gaps.length > 0 && (
-          <div className="text-slate-400">
-            隙間 {gaps.length} 箇所 ({formatDuration(gaps.reduce((s, g) => s + g.minutes, 0))})
+      {/* 選択日サマリー（エントリがある場合のみ） */}
+      {entries.length > 0 && (
+        <div className="flex items-center gap-4 text-sm">
+          <div className="bg-indigo-50 text-indigo-700 rounded-lg px-3 py-1.5 font-semibold">
+            選択日 合計 {formatDuration(totalMinutes)}
           </div>
-        )}
-      </div>
-
-      {/* 24時間ビジュアルバー */}
-      <div>
-        <div className="relative h-10 bg-slate-100 rounded-xl overflow-hidden">
-          {entries.map(e => {
-            const left = (timeToMinutes(e.start_time) / 1440) * 100
-            const width = (e.duration_minutes / 1440) * 100
-            const color = hashProject(e.project)
-            return (
-              <div
-                key={e.id}
-                className="absolute top-0 h-full transition-all"
-                style={{
-                  left: `${left}%`,
-                  width: `${Math.max(width, 0.3)}%`,
-                  backgroundColor: color.bar,
-                  opacity: 0.85,
-                }}
-                title={`${e.project} (${e.start_time}–${e.end_time})`}
-              />
-            )
-          })}
-          {/* 隙間 */}
-          {gaps.map((g, i) => {
-            const left = (timeToMinutes(g.start) / 1440) * 100
-            const width = (g.minutes / 1440) * 100
-            return (
-              <div
-                key={i}
-                className="absolute top-0 h-full border-x border-dashed border-slate-300"
-                style={{ left: `${left}%`, width: `${width}%`, backgroundColor: 'rgba(148,163,184,0.15)' }}
-              />
-            )
-          })}
+          {gaps.length > 0 && (
+            <div className="text-slate-400">
+              隙間 {gaps.length} 箇所 ({formatDuration(gaps.reduce((s, g) => s + g.minutes, 0))})
+            </div>
+          )}
         </div>
-        {/* 時間軸 */}
-        <div className="relative h-5 mt-1">
-          {HOUR_MARKS.map(h => (
-            <span
-              key={h}
-              className="absolute text-xs text-slate-400 -translate-x-1/2"
-              style={{ left: `${(h / 24) * 100}%` }}
-            >
-              {String(h).padStart(2, '0')}
-            </span>
-          ))}
-        </div>
-      </div>
+      )}
 
-      {/* エントリリスト */}
-      <div className="space-y-2">
-        {[...entries]
-          .sort((a, b) => timeToMinutes(a.start_time) - timeToMinutes(b.start_time))
-          .map(entry => {
-            const color = hashProject(entry.project)
-            return (
-              <div
-                key={entry.id}
-                className="flex items-center gap-3 p-3 rounded-xl border border-slate-100 hover:border-slate-200 hover:shadow-sm transition-all group"
+      {/* 24時間ビジュアルバー（選択日） */}
+      {entries.length > 0 && (
+        <div>
+          <div className="relative h-10 bg-slate-100 rounded-xl overflow-hidden">
+            {entries.map(e => {
+              const startMin = timeToMinutes(e.start_time)
+              const endMin = effectiveEndMinutes(e)
+              const left = (startMin / 1440) * 100
+              const width = ((endMin - startMin) / 1440) * 100
+              const color = hashProject(e.project)
+              return (
+                <div
+                  key={e.id}
+                  className="absolute top-0 h-full transition-all"
+                  style={{
+                    left: `${left}%`,
+                    width: `${Math.max(width, 0.3)}%`,
+                    backgroundColor: color.bar,
+                    opacity: 0.85,
+                  }}
+                  title={`${e.project} (${e.start_time}–${e.end_date !== e.start_date ? '翌' : ''}${e.end_time})`}
+                />
+              )
+            })}
+            {/* 隙間 */}
+            {gaps.map((g, i) => {
+              const left = (timeToMinutes(g.start) / 1440) * 100
+              const width = (g.minutes / 1440) * 100
+              return (
+                <div
+                  key={i}
+                  className="absolute top-0 h-full border-x border-dashed border-slate-300"
+                  style={{ left: `${left}%`, width: `${width}%`, backgroundColor: 'rgba(148,163,184,0.15)' }}
+                />
+              )
+            })}
+          </div>
+          {/* 時間軸 */}
+          <div className="relative h-5 mt-1">
+            {HOUR_MARKS.map(h => (
+              <span
+                key={h}
+                className="absolute text-xs text-slate-400 -translate-x-1/2"
+                style={{ left: `${(h / 24) * 100}%` }}
               >
+                {String(h).padStart(2, '0')}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 直近エントリリスト（recentEntries・日付付き） */}
+      <div className="space-y-2">
+        {recentEntries.map(entry => {
+          const color = hashProject(entry.project)
+          const crossDay = entry.end_date && entry.end_date !== entry.start_date
+          return (
+            <div
+              key={entry.id}
+              className="p-3 rounded-xl border border-slate-100 hover:border-slate-200 hover:shadow-sm transition-all group"
+            >
+              <div className="flex items-center gap-3">
                 {/* カラーバー */}
                 <div className={`w-1 h-10 rounded-full flex-shrink-0 ${color.bg}`} />
 
+                {/* 日付 */}
+                <div className="w-12 flex-shrink-0 text-xs font-mono font-semibold text-slate-500">
+                  {formatShortDate(entry.start_date)}
+                </div>
+
                 {/* 時間 */}
-                <div className="w-28 flex-shrink-0">
+                <div className="w-32 flex-shrink-0">
                   <span className="font-mono text-sm font-semibold text-slate-700">
                     {entry.start_time}
                   </span>
                   <span className="text-slate-400 mx-1 text-xs">–</span>
+                  {crossDay && (
+                    <span className="text-xs font-semibold text-orange-400 mr-0.5">翌</span>
+                  )}
                   <span className="font-mono text-sm font-semibold text-slate-700">
                     {entry.end_time}
                   </span>
@@ -166,6 +194,15 @@ export default function Timeline({ entries, onDelete }) {
                   {entry.task_type}
                 </div>
 
+                {/* 複製ボタン */}
+                <button
+                  onClick={() => onClone(entry)}
+                  className="btn-secondary opacity-0 group-hover:opacity-100 flex-shrink-0 text-xs"
+                  title={`${selectedDate} のフォームに展開`}
+                >
+                  複製
+                </button>
+
                 {/* 削除ボタン */}
                 <button
                   onClick={() => onDelete(entry.id)}
@@ -174,25 +211,16 @@ export default function Timeline({ entries, onDelete }) {
                   削除
                 </button>
               </div>
-            )
-          })}
 
-        {/* 隙間時間表示 */}
-        {gaps.map((g, i) => (
-          <div
-            key={`gap-${i}`}
-            className="flex items-center gap-3 p-3 rounded-xl border border-dashed border-slate-200"
-          >
-            <div className="w-1 h-6 rounded-full bg-slate-200 flex-shrink-0" />
-            <div className="w-28 flex-shrink-0 font-mono text-sm text-slate-400">
-              {g.start} – {g.end}
+              {/* 作業メモ */}
+              {entry.memo && (
+                <div className="mt-1.5 ml-4 pl-4 border-l-2 border-slate-100 text-xs text-slate-500">
+                  {entry.memo}
+                </div>
+              )}
             </div>
-            <div className="w-16 flex-shrink-0 text-xs text-slate-400">
-              {formatDuration(g.minutes)}
-            </div>
-            <div className="text-xs text-slate-400 italic">未記録</div>
-          </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )

@@ -29,6 +29,7 @@ function formatDateLabel(dateStr) {
 export default function App() {
   const [selectedDate, setSelectedDate] = useState(toToday)
   const [entries, setEntries] = useState([])
+  const [recentEntries, setRecentEntries] = useState([])
   const [analytics, setAnalytics] = useState(null)
   const [analyticsPeriod, setAnalyticsPeriod] = useState('week') // today | week | month
   const [tags, setTags] = useState({ projects: [], task_types: DEFAULT_TASK_TYPES })
@@ -38,10 +39,13 @@ export default function App() {
 
   // フォーム状態
   const [form, setForm] = useState({
+    start_date: toToday(),
     start_time: '',
+    end_date: toToday(),
     end_time: '',
     project: '',
     task_type: '実装',
+    memo: '',
   })
 
   // ---------- Data Fetching ----------
@@ -71,6 +75,15 @@ export default function App() {
     }
   }, [])
 
+  const fetchRecentEntries = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API}/entries/recent`)
+      setRecentEntries(res.data)
+    } catch {
+      // non-critical
+    }
+  }, [])
+
   const fetchTags = useCallback(async () => {
     try {
       const res = await axios.get(`${API}/tags`)
@@ -85,6 +98,8 @@ export default function App() {
 
   useEffect(() => {
     fetchEntries(selectedDate)
+    // 日付ナビ変更時にフォームの開始・終了日も同期
+    setForm(f => ({ ...f, start_date: selectedDate, end_date: selectedDate }))
   }, [selectedDate, fetchEntries])
 
   useEffect(() => {
@@ -95,6 +110,10 @@ export default function App() {
     fetchTags()
   }, [fetchTags])
 
+  useEffect(() => {
+    fetchRecentEntries()
+  }, [fetchRecentEntries])
+
   // ---------- Actions ----------
 
   const showSuccess = (msg) => {
@@ -104,18 +123,19 @@ export default function App() {
 
   const handleSubmit = async (e) => {
     e.preventDefault()
-    if (!form.start_time || !form.end_time || !form.project || !form.task_type) {
+    if (!form.start_date || !form.start_time || !form.end_date || !form.end_time || !form.project || !form.task_type) {
       setError('全項目を入力してください')
       return
     }
     setError('')
     setLoading(true)
     try {
-      await axios.post(`${API}/entries`, { ...form, date: selectedDate })
-      setForm(f => ({ ...f, start_time: '', end_time: '' }))
+      await axios.post(`${API}/entries`, { ...form })
+      setForm(f => ({ ...f, start_time: '', end_time: '', memo: '' }))
       await fetchEntries(selectedDate)
       await fetchAnalytics(analyticsPeriod)
       await fetchTags()
+      await fetchRecentEntries()
       showSuccess('記録しました')
     } catch (err) {
       setError(err.response?.data?.detail || '保存に失敗しました')
@@ -129,24 +149,24 @@ export default function App() {
       await axios.delete(`${API}/entries/${id}`)
       await fetchEntries(selectedDate)
       await fetchAnalytics(analyticsPeriod)
+      await fetchRecentEntries()
     } catch {
       setError('削除に失敗しました')
     }
   }
 
-  const handleYesterdayClone = async () => {
-    setLoading(true)
-    try {
-      await axios.post(`${API}/entries/yesterday-clone`)
-      setSelectedDate(toToday())
-      await fetchEntries(toToday())
-      await fetchAnalytics(analyticsPeriod)
-      showSuccess('昨日のログを今日にコピーしました')
-    } catch (err) {
-      setError(err.response?.data?.detail || 'コピーに失敗しました')
-    } finally {
-      setLoading(false)
-    }
+  const handleClone = (entry) => {
+    const crossDay = entry.end_date && entry.end_date > entry.start_date
+    setForm({
+      start_date: selectedDate,
+      start_time: entry.start_time,
+      end_date: crossDay ? addDays(selectedDate, 1) : selectedDate,
+      end_time: entry.end_time,
+      project: entry.project,
+      task_type: entry.task_type,
+      memo: entry.memo || '',
+    })
+    window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
   // ---------- Render ----------
@@ -158,9 +178,9 @@ export default function App() {
         <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center">
-              <span className="text-white font-bold text-sm">TL</span>
+              <span className="text-white font-bold text-sm">WT</span>
             </div>
-            <h1 className="text-lg font-bold text-slate-800 tracking-tight">TimeLayer</h1>
+            <h1 className="text-lg font-bold text-slate-800 tracking-tight">workTrace</h1>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -212,18 +232,27 @@ export default function App() {
             <h2 className="font-semibold text-slate-700">
               {formatDateLabel(selectedDate)} の記録を追加
             </h2>
-            <button
-              onClick={handleYesterdayClone}
-              disabled={loading}
-              className="btn-secondary text-sm flex items-center gap-1.5"
-            >
-              <span>📋</span> Yesterday Clone
-            </button>
           </div>
 
           <form onSubmit={handleSubmit} className="grid grid-cols-2 md:grid-cols-5 gap-3">
             <div>
               <label className="label">開始</label>
+              <input
+                type="date"
+                value={form.start_date}
+                onChange={e => {
+                  const newStart = e.target.value
+                  const maxEnd = addDays(newStart, 1)
+                  setForm(f => ({
+                    ...f,
+                    start_date: newStart,
+                    // 終了日が範囲外になった場合は自動補正
+                    end_date: f.end_date > maxEnd ? maxEnd : f.end_date < newStart ? newStart : f.end_date,
+                  }))
+                }}
+                className="input-field mb-1"
+                required
+              />
               <input
                 type="time"
                 value={form.start_time}
@@ -234,6 +263,15 @@ export default function App() {
             </div>
             <div>
               <label className="label">終了</label>
+              <input
+                type="date"
+                value={form.end_date}
+                min={form.start_date}
+                max={addDays(form.start_date, 1)}
+                onChange={e => setForm(f => ({ ...f, end_date: e.target.value }))}
+                className="input-field mb-1"
+                required
+              />
               <input
                 type="time"
                 value={form.end_time}
@@ -278,6 +316,16 @@ export default function App() {
                 {loading ? '保存中…' : '記録する'}
               </button>
             </div>
+            <div className="col-span-2 md:col-span-5">
+              <label className="label">作業メモ（任意）</label>
+              <input
+                type="text"
+                value={form.memo}
+                onChange={e => setForm(f => ({ ...f, memo: e.target.value }))}
+                placeholder="作業内容のメモを入力…"
+                className="input-field"
+              />
+            </div>
           </form>
         </section>
 
@@ -286,10 +334,10 @@ export default function App() {
           <h2 className="font-semibold text-slate-700 mb-4">
             タイムライン
             <span className="ml-2 text-sm font-normal text-slate-400">
-              {entries.length} 件
+              直近 {recentEntries.length} 件
             </span>
           </h2>
-          <Timeline entries={entries} onDelete={handleDelete} />
+          <Timeline entries={entries} recentEntries={recentEntries} onDelete={handleDelete} onClone={handleClone} selectedDate={selectedDate} />
         </section>
 
         {/* Analytics */}

@@ -1,12 +1,12 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
 from pydantic import BaseModel
 from datetime import datetime, timedelta, date as date_type
 from typing import Optional
 
-DATABASE_URL = "sqlite:///./timelayer.db"
+DATABASE_URL = "sqlite:///./worktrace.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -24,19 +24,33 @@ class TimeEntry(Base):
     project = Column(String, nullable=False)
     task_type = Column(String, nullable=False)
     date = Column(String, nullable=False)  # YYYY-MM-DD (start_timeの日付)
+    memo = Column(String, nullable=True, default='')
 
 
 Base.metadata.create_all(bind=engine)
+
+# 既存DBへのマイグレーション: memo カラムが無ければ追加
+with engine.connect() as _conn:
+    _cols = [row[1] for row in _conn.execute(text("PRAGMA table_info(time_entries)")).fetchall()]
+    if "memo" not in _cols:
+        _conn.execute(text("ALTER TABLE time_entries ADD COLUMN memo VARCHAR DEFAULT ''"))
+        _conn.commit()
 
 
 # ---------- Pydantic Schemas ----------
 
 class TimeEntryCreate(BaseModel):
+    start_date: str   # "YYYY-MM-DD"
     start_time: str   # "HH:MM"
+    end_date: str     # "YYYY-MM-DD"
     end_time: str     # "HH:MM"
     project: str
     task_type: str
-    date: str         # "YYYY-MM-DD"
+    memo: Optional[str] = ''
+
+
+class CloneRequest(BaseModel):
+    target_date: str  # "YYYY-MM-DD"
 
 
 # ---------- Helpers ----------
@@ -45,10 +59,13 @@ def entry_to_dict(entry: TimeEntry) -> dict:
     duration = int((entry.end_time - entry.start_time).total_seconds() / 60)
     return {
         "id": entry.id,
+        "start_date": entry.start_time.strftime("%Y-%m-%d"),
         "start_time": entry.start_time.strftime("%H:%M"),
+        "end_date": entry.end_time.strftime("%Y-%m-%d"),
         "end_time": entry.end_time.strftime("%H:%M"),
         "project": entry.project,
         "task_type": entry.task_type,
+        "memo": entry.memo or '',
         "date": entry.date,
         "duration_minutes": duration,
     }
@@ -63,10 +80,9 @@ def resolve_overlaps(db: Session, new_entry: TimeEntry) -> None:
     n_start = new_entry.start_time
     n_end = new_entry.end_time
 
-    # 重なる既存エントリを全取得（同日のみ）
+    # 重なる既存エントリを全取得（日付をまたぐ場合も含め datetime で比較）
     overlapping = db.query(TimeEntry).filter(
         TimeEntry.id != new_entry.id,
-        TimeEntry.date == new_entry.date,
         TimeEntry.start_time < n_end,
         TimeEntry.end_time > n_start,
     ).all()
@@ -87,12 +103,14 @@ def resolve_overlaps(db: Session, new_entry: TimeEntry) -> None:
             # 前半: [e_start, n_start]
             e.end_time = n_start
             # 後半: [n_end, e_end] を新規エントリとして追加
+            # date は後半セグメントの実際の開始日を使う（日またぎ対応）
             to_add.append(TimeEntry(
                 start_time=n_end,
                 end_time=e_end,
                 project=e.project,
                 task_type=e.task_type,
-                date=e.date,
+                memo=e.memo or '',
+                date=n_end.strftime("%Y-%m-%d"),
             ))
 
         elif e_start < n_start:
@@ -101,7 +119,9 @@ def resolve_overlaps(db: Session, new_entry: TimeEntry) -> None:
 
         else:
             # ケース4: 右側重複 (既存が右にはみ出す) → 既存の始端を短縮
+            # date も新しい開始日時に合わせて更新（日またぎ対応）
             e.start_time = n_end
+            e.date = n_end.strftime("%Y-%m-%d")
 
     for e in to_delete:
         db.delete(e)
@@ -119,7 +139,7 @@ def get_db():
 
 # ---------- App ----------
 
-app = FastAPI(title="TimeLayer API")
+app = FastAPI(title="workTrace API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -148,20 +168,24 @@ def get_entries(date: str, db: Session = Depends(get_db)):
 def create_entry(body: TimeEntryCreate, db: Session = Depends(get_db)):
     """新規エントリを追加。重複は後出し優先で自動解決する。"""
     try:
-        start_dt = datetime.strptime(f"{body.date} {body.start_time}", "%Y-%m-%d %H:%M")
-        end_dt = datetime.strptime(f"{body.date} {body.end_time}", "%Y-%m-%d %H:%M")
+        start_dt = datetime.strptime(f"{body.start_date} {body.start_time}", "%Y-%m-%d %H:%M")
+        end_dt = datetime.strptime(f"{body.end_date} {body.end_time}", "%Y-%m-%d %H:%M")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date/time format")
 
     if end_dt <= start_dt:
-        raise HTTPException(status_code=400, detail="終了時間は開始時間より後にしてください")
+        raise HTTPException(status_code=400, detail="終了日時は開始日時より後にしてください")
+
+    if (end_dt.date() - start_dt.date()).days > 1:
+        raise HTTPException(status_code=400, detail="終了日は開始日の翌日まで指定可能です")
 
     new_entry = TimeEntry(
         start_time=start_dt,
         end_time=end_dt,
         project=body.project,
         task_type=body.task_type,
-        date=body.date,
+        memo=body.memo or '',
+        date=body.start_date,
     )
     db.add(new_entry)
     db.flush()  # IDを確定させる
@@ -226,41 +250,46 @@ def get_analytics(start_date: str, end_date: str, db: Session = Depends(get_db))
     }
 
 
-@app.post("/entries/yesterday-clone")
-def yesterday_clone(db: Session = Depends(get_db)):
-    """昨日の作業ログ構成を今日にコピーする"""
-    today = date_type.today()
-    yesterday = today - timedelta(days=1)
-    today_str = today.strftime("%Y-%m-%d")
-    yesterday_str = yesterday.strftime("%Y-%m-%d")
+@app.post("/entries/{entry_id}/clone", status_code=201)
+def clone_entry(entry_id: int, body: CloneRequest, db: Session = Depends(get_db)):
+    """指定エントリを target_date の日付でクローンする（時刻はそのまま、日付のみ置換）"""
+    entry = db.query(TimeEntry).filter(TimeEntry.id == entry_id).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Entry not found")
 
-    yesterday_entries = (
+    try:
+        target = datetime.strptime(body.target_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid target_date format")
+
+    # 元エントリの開始日からの日数差を計算してシフト
+    delta = target - entry.start_time.date()
+    new_entry = TimeEntry(
+        start_time=entry.start_time + timedelta(days=delta.days),
+        end_time=entry.end_time + timedelta(days=delta.days),
+        project=entry.project,
+        task_type=entry.task_type,
+        memo=entry.memo or '',
+        date=body.target_date,
+    )
+    db.add(new_entry)
+    db.flush()
+    resolve_overlaps(db, new_entry)
+    db.commit()
+    db.refresh(new_entry)
+    return entry_to_dict(new_entry)
+
+
+@app.get("/entries/recent")
+def get_recent_entries(limit: int = 20, db: Session = Depends(get_db)):
+    """直近 limit 件のエントリを新しい順で返す"""
+    entries = (
         db.query(TimeEntry)
-        .filter(TimeEntry.date == yesterday_str)
-        .order_by(TimeEntry.start_time)
+        .order_by(TimeEntry.start_time.desc())
+        .limit(limit)
         .all()
     )
-
-    if not yesterday_entries:
-        raise HTTPException(status_code=404, detail="昨日のエントリが見つかりません")
-
-    created = []
-    for e in yesterday_entries:
-        new_entry = TimeEntry(
-            start_time=e.start_time + timedelta(days=1),
-            end_time=e.end_time + timedelta(days=1),
-            project=e.project,
-            task_type=e.task_type,
-            date=today_str,
-        )
-        db.add(new_entry)
-        db.flush()
-        resolve_overlaps(db, new_entry)
-        db.commit()
-        db.refresh(new_entry)
-        created.append(entry_to_dict(new_entry))
-
-    return created
+    return [entry_to_dict(e) for e in entries]
 
 
 @app.get("/tags")

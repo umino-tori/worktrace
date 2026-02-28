@@ -209,5 +209,6 @@ __marimo__/
 claude.md
 gemini.md
 instruction
-.gitignore*Zone*Identifier
 timelayer.db
+worktrace.db
+node_modules
